@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- **Directives inside quoted SQL are no longer treated as instructions.** `-- safety-assured:start` / `-- safety-assured:end` and `-- diesel-guard:disable ...` are now only recognized in SQL line comments that appear outside of string literals, quoted identifiers, dollar-quoted strings (e.g. `$$ ... $$` function bodies) and block comments. Previously a directive-looking line inside a dollar-quoted body could open a phantom ignore range and silently suppress checks such as a later `DROP TABLE`, and a disable directive embedded in a string literal was applied globally. CRLF and LF inputs produce identical results.
+
+### Changed
+
+- **Unknown and conflicting migration-scoped disable names fail closed.** An unrecognized check name in a `-- diesel-guard:disable ...` directive now aborts the run with an error instead of printing a warning and continuing, and listing the same check more than once is rejected as a conflicting directive instead of being silently deduplicated.
+
 ## 0.12.0 - 2026-06-25
 
 ### Breaking Changes

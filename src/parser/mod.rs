@@ -47,6 +47,11 @@ pub fn parse(sql: &str) -> Result<Vec<RawStmt>> {
 pub fn parse_with_metadata(sql: &str) -> Result<ParsedSql> {
     let ignore_ranges = comment_parser::CommentParser::parse_ignore_ranges(sql)?;
     let disabled_checks = comment_parser::CommentParser::parse_disabled_checks(sql);
+    if let Some(name) = comment_parser::CommentParser::find_duplicate_disabled_check(sql) {
+        return Err(DieselGuardError::parse_error(format!(
+            "Conflicting check name '{name}' in migration-scoped disable_checks: the check is disabled more than once. List each check at most once."
+        )));
+    }
     let stmts = parse(sql)?;
 
     Ok(ParsedSql {
