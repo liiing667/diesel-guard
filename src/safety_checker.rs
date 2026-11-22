@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::parser;
 use crate::scripting;
+use crate::violation::RuleGeneration;
 use camino::Utf8Path;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
@@ -13,6 +14,9 @@ pub struct SafetyChecker {
     registry: Registry,
     config: Config,
     known_check_names: Vec<String>,
+    /// Generation shared by the built-in rules, the loaded custom scripts,
+    /// and every violation this checker produces.
+    generation: RuleGeneration,
 }
 
 impl SafetyChecker {
@@ -23,16 +27,30 @@ impl SafetyChecker {
     /// Returns [`crate::config::ConfigError::InvalidCheckName`] if any name in `enable_checks`,
     /// `disable_checks`, or `warn_checks` is not a known check name (built-in or
     /// custom script stem from `custom_checks_dir`).
+    ///
+    /// Returns [`crate::config::ConfigError::ScriptLoadError`] if a custom
+    /// script cannot be read or compiled. The whole build fails rather than
+    /// silently dropping the broken script: a checker must never report
+    /// "all rules passed" while running only part of the configured rule set.
     pub fn with_config(config: Config) -> std::result::Result<Self, crate::config::ConfigError> {
-        let mut registry = Registry::with_config(&config);
+        Self::build(config, RuleGeneration::FIRST)
+    }
+
+    /// Construct a checker whose entire rule set (built-in checks plus every
+    /// custom script) belongs to `generation`. All violation evidence the
+    /// checker produces is stamped with the same generation.
+    fn build(
+        config: Config,
+        generation: RuleGeneration,
+    ) -> std::result::Result<Self, crate::config::ConfigError> {
+        let mut registry = Registry::with_config_and_generation(&config, generation);
 
         if let Some(ref dir) = config.custom_checks_dir {
             let dir = Utf8Path::new(dir);
             if dir.exists() {
-                let (checks, errors) = scripting::load_custom_checks(dir, &config);
-                for err in errors {
-                    eprintln!("Warning: {err}");
-                }
+                // Strict loading: any broken script aborts the build so the
+                // checker can never run a half-loaded custom rule set.
+                let checks = scripting::load_custom_checks_strict(dir, &config)?;
                 for check in checks {
                     registry.add_check(check);
                 }
@@ -90,12 +108,45 @@ impl SafetyChecker {
             registry,
             config,
             known_check_names,
+            generation,
         })
     }
 
     /// Expose the registry for introspection (e.g. list-checks, explain).
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Generation of the rule set currently backing this checker.
+    ///
+    /// The built-in rules, the loaded custom script collection, and all
+    /// violation evidence returned by this checker share this generation.
+    #[must_use]
+    pub fn rule_generation(&self) -> RuleGeneration {
+        self.generation
+    }
+
+    /// Atomically reload every rule (built-in checks and custom scripts) from
+    /// disk using the same configuration.
+    ///
+    /// On success the checker moves to a fresh rule generation and
+    /// [`SafetyChecker::rule_generation`] reflects it. If anything fails
+    /// (e.g. a newly added script does not compile), the rebuild is discarded:
+    /// the checker keeps its previous, fully loaded generation and still
+    /// runs the complete previous rule set. A failed hot reload therefore can
+    /// never leave the checker running half a rule set while claiming success.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the same errors as [`SafetyChecker::with_config`]; on error
+    /// the checker is left unchanged.
+    pub fn reload(&mut self) -> std::result::Result<RuleGeneration, crate::config::ConfigError> {
+        let next_generation = self.generation.next();
+        // Build the full replacement before touching `self` so any failure
+        // leaves the current generation completely intact.
+        let rebuilt = Self::build(self.config.clone(), next_generation)?;
+        *self = rebuilt;
+        Ok(next_generation)
     }
 
     /// Build the migration adapter for the configured framework.
@@ -761,6 +812,40 @@ mod tests {
     fn test_default_creates_checker() {
         let checker = SafetyChecker::default();
         assert_ne!(checker.registry().active_check_names().len(), 0);
+    }
+
+    #[test]
+    fn test_rule_generation_is_shared_by_registry_and_evidence() {
+        let checker = SafetyChecker::with_config(Config {
+            enable_checks: vec!["DropColumnCheck".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let generation = checker.rule_generation();
+        assert_eq!(generation, RuleGeneration::FIRST);
+        assert_eq!(checker.registry().generation(), generation);
+
+        let violations = checker
+            .check_sql("ALTER TABLE users DROP COLUMN email;")
+            .unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].1.rule_generation(), generation);
+    }
+
+    #[test]
+    fn test_reload_without_custom_dir_advances_generation() {
+        let mut checker = SafetyChecker::default();
+        let first = checker.rule_generation();
+
+        let next = checker.reload().expect("reload of built-ins succeeds");
+        assert_eq!(next, first.next());
+        assert_eq!(checker.rule_generation(), next);
+        assert_eq!(checker.registry().generation(), next);
+
+        // A fresh checker still starts at the first generation.
+        let fresh = SafetyChecker::default();
+        assert_eq!(fresh.rule_generation(), RuleGeneration::FIRST);
     }
 
     #[test]

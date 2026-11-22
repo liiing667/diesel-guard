@@ -28,7 +28,7 @@ pub mod violation;
 pub use adapters::{MigrationAdapter, MigrationContext, MigrationFile};
 pub use config::{Config, ConfigError};
 pub use safety_checker::SafetyChecker;
-pub use violation::Violation;
+pub use violation::{RuleGeneration, Violation};
 
 /// A list of `(line_number, violation)` pairs produced by a single SQL file.
 ///

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Breaking Changes
+
+- **Custom script load failures are now fatal.** If any `.rhai` script in `custom_checks_dir` cannot be read or compiled, checker construction (and the `check` command) now aborts with a `Custom check failed to load` error instead of printing a warning and skipping the broken script. Skipping silently allowed a migration to pass while only half the configured rule set ran. Runtime errors inside an otherwise valid script still surface as `SCRIPT ERROR` violations.
+
+### Added
+
+- **Rule generations.** Each checker is backed by one `RuleGeneration` shared by the built-in checks, the loaded custom scripts, and every violation they produce. Access it via `SafetyChecker::rule_generation()`, `Registry::generation()`, and `Violation::rule_generation()`.
+- **`SafetyChecker::reload()`** atomically rebuilds the full rule set from disk. On success it returns the new generation; on failure (e.g. a newly added script does not compile) it returns the error and keeps the previous, fully loaded generation untouched, so a hot reload can never leave the checker running half a rule set.
+
 ## 0.12.0 - 2026-06-25
 
 ### Breaking Changes

@@ -247,23 +247,59 @@ fn create_engine() -> Engine {
 ///
 /// Returns successfully compiled checks and any errors encountered.
 /// Compilation errors are non-fatal — they're collected as `ScriptError`s.
+///
+/// Prefer [`load_custom_checks_strict`] when building a checker: a partial
+/// rule set must never back a "all rules passed" result, so checker
+/// construction treats any script failure as fatal.
 pub fn load_custom_checks(
     dir: &Utf8Path,
     config: &crate::config::Config,
 ) -> (Vec<Box<dyn Check>>, Vec<ScriptError>) {
+    match load_custom_checks_strict(dir, config) {
+        Ok(checks) => (checks, Vec::new()),
+        Err(err) => (Vec::new(), vec![err]),
+    }
+}
+
+impl From<ScriptError> for crate::config::ConfigError {
+    fn from(err: ScriptError) -> Self {
+        Self::ScriptLoadError {
+            details: err.to_string(),
+        }
+    }
+}
+
+/// Load all `.rhai` files from a directory and compile them into custom checks.
+///
+/// Unlike [`load_custom_checks`], every read or compilation failure is fatal:
+/// the returned checks always represent the complete set of scripts on disk
+/// (minus scripts disabled via config). Callers that need to guarantee the
+/// custom rule set and the built-in rules belong to one consistent rule
+/// generation must use this function — skipping a broken script would let a
+/// migration pass while only half the configured rules actually ran.
+///
+/// # Errors
+///
+/// Returns a [`ScriptError`] if the directory cannot be read, a script cannot
+/// be read, or a script fails to compile. It converts into
+/// [`crate::config::ConfigError::ScriptLoadError`] via the `From` impl when
+/// surfaced through [`crate::SafetyChecker::with_config`].
+pub fn load_custom_checks_strict(
+    dir: &Utf8Path,
+    config: &crate::config::Config,
+) -> std::result::Result<Vec<Box<dyn Check>>, ScriptError> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
-    let mut errors: Vec<ScriptError> = Vec::new();
 
     let engine = Arc::new(create_engine());
 
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
-            errors.push(ScriptError {
-                file: dir.to_string(),
+            return Err(ScriptError {
+                dir.as_str(),
+                .to_string(),
                 message: format!("Failed to read directory: {e}"),
             });
-            return (checks, errors);
         }
     };
 
@@ -290,11 +326,10 @@ pub fn load_custom_checks(
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                errors.push(ScriptError {
+                return Err(ScriptError {
                     file: path.display().to_string(),
                     message: format!("Failed to read: {e}"),
                 });
-                continue;
             }
         };
 
@@ -310,7 +345,7 @@ pub fn load_custom_checks(
                 }));
             }
             Err(e) => {
-                errors.push(ScriptError {
+                return Err(ScriptError {
                     file: path.display().to_string(),
                     message: format!("Compilation error: {e}"),
                 });
@@ -318,7 +353,7 @@ pub fn load_custom_checks(
         }
     }
 
-    (checks, errors)
+    Ok(checks)
 }
 
 #[cfg(test)]
@@ -502,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_custom_checks_from_directory() {
+    fn test_load_custom_checks_strict_from_directory() {
         let dir = tempdir().expect("Failed to create temp dir");
         let dir_path = Utf8Path::from_path(dir.path()).unwrap();
 
@@ -519,20 +554,44 @@ mod tests {
         )
         .unwrap();
 
-        // Write an invalid script
-        fs::write(dir.path().join("broken.rhai"), "this is not valid {{{").unwrap();
-
         // Write a non-rhai file (should be ignored)
         fs::write(dir.path().join("notes.txt"), "not a script").unwrap();
 
         let config = crate::config::Config::default();
-        let (checks, errors) = load_custom_checks(dir_path, &config);
+        let checks = load_custom_checks_strict(dir_path, &config).expect("valid dir loads");
 
         // One valid check loaded
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].name(), "require_concurrent");
+    }
 
-        // One compilation error reported
+    #[test]
+    fn test_load_custom_checks_strict_compilation_error_is_fatal() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+
+        // A valid sibling script must not mask the broken one: strict loading
+        // fails the whole batch instead of silently running half the rules.
+        fs::write(
+            dir.path().join("valid.rhai"),
+            r#"
+            let stmt = node.IndexStmt;
+            if stmt == () { return; }
+            #{ operation: "valid_check", problem: "p", safe_alternative: "s" }
+            "#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("broken.rhai"), "this is not valid {{{").unwrap();
+
+        let config = crate::config::Config::default();
+        let err = load_custom_checks_strict(dir_path, &config)
+            .expect_err("a broken script must fail strict loading");
+        assert!(err.file.contains("broken.rhai"));
+        assert!(err.message.starts_with("Compilation error:"));
+
+        // The lenient wrapper preserves its historical (checks, errors) shape.
+        let (checks, errors) = load_custom_checks(dir_path, &config);
+        assert_eq!(checks.len(), 0);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].file.contains("broken.rhai"));
     }
@@ -670,6 +729,11 @@ mod tests {
         let missing = dir.path().join("does_not_exist");
         let dir_path = Utf8Path::from_path(&missing).unwrap();
         let config = crate::config::Config::default();
+        let err = load_custom_checks_strict(dir_path, &config)
+            .expect_err("missing directory must fail strict loading");
+        assert!(err.message.starts_with("Failed to read directory:"));
+
+        // Lenient wrapper still reports it through its historical shape.
         let (checks, errors) = load_custom_checks(dir_path, &config);
         assert_eq!(checks.len(), 0);
         assert_eq!(errors.len(), 1);
@@ -742,6 +806,10 @@ mod tests {
         fs::create_dir(&script_path).unwrap();
 
         let config = crate::config::Config::default();
+        let err = load_custom_checks_strict(dir_path, &config)
+            .expect_err("an unreadable script must fail strict loading");
+        assert!(err.message.starts_with("Failed to read:"));
+
         let (checks, errors) = load_custom_checks(dir_path, &config);
 
         assert_eq!(checks.len(), 0);

@@ -37,6 +37,13 @@ pub enum ConfigError {
 
     #[error("enable_checks and disable_checks cannot both be set")]
     ConflictingCheckConfig,
+
+    /// A custom check script could not be read or compiled.
+    ///
+    /// Fatal: continuing would run a rule set that silently misses the broken
+    /// script, which could report "all rules passed" against half the checks.
+    #[error("Custom check failed to load: {details}")]
+    ScriptLoadError { details: String },
 }
 
 impl Diagnostic for ConfigError {
@@ -55,6 +62,9 @@ impl Diagnostic for ConfigError {
             Self::ConflictingCheckConfig => {
                 Some(Box::new("diesel_guard::config::conflicting_check_config"))
             }
+            Self::ScriptLoadError { .. } => {
+                Some(Box::new("diesel_guard::config::script_load_error"))
+            }
         }
     }
 
@@ -70,6 +80,9 @@ impl Diagnostic for ConfigError {
             Self::InvalidFramework { .. } => Some(Box::new("Valid values: \"diesel\", \"sqlx\"")),
             Self::ConflictingCheckConfig => Some(Box::new(
                 "Use either enable_checks (whitelist) or disable_checks (blacklist), not both.",
+            )),
+            Self::ScriptLoadError { .. } => Some(Box::new(
+                "Fix or remove the broken custom check script so the full rule set loads.",
             )),
             _ => None,
         }
@@ -423,6 +436,17 @@ postgres_version = 14
         assert_eq!(code, "diesel_guard::config::invalid_framework");
     }
 
+    #[test]
+    fn test_diagnostic_code_script_load_error() {
+        use miette::Diagnostic;
+        let err = ConfigError::ScriptLoadError {
+            details: "checks/broken.rhai: Compilation error: boom".to_string(),
+        };
+        let code = err.code().unwrap().to_string();
+        assert_eq!(code, "diesel_guard::config::script_load_error");
+        assert!(err.to_string().contains("checks/broken.rhai"));
+    }
+
     // --- Diagnostic::help() tests ---
 
     #[test]
@@ -455,6 +479,16 @@ postgres_version = 14
         };
         let help = err.help().unwrap().to_string();
         assert_eq!(help, "Valid values: \"diesel\", \"sqlx\"");
+    }
+
+    #[test]
+    fn test_diagnostic_help_script_load_error() {
+        use miette::Diagnostic;
+        let err = ConfigError::ScriptLoadError {
+            details: "checks/broken.rhai: Compilation error: boom".to_string(),
+        };
+        let help = err.help().unwrap().to_string();
+        assert!(help.contains("Fix or remove the broken custom check script"));
     }
 
     #[test]

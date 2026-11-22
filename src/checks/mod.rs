@@ -98,7 +98,7 @@ mod helpers {
 
 use crate::ViolationList;
 use crate::parser::IgnoreRange;
-use crate::violation::Violation;
+use crate::violation::{RuleGeneration, Violation};
 pub use helpers::*;
 use pg_helpers::{NodeEnum, extract_node};
 use pg_query::protobuf::RawStmt;
@@ -163,6 +163,9 @@ pub trait Check: Send + Sync + CheckDoc {
 /// Registry of all available checks
 pub struct Registry {
     checks: Vec<Box<dyn Check>>,
+    /// Generation shared by every check in this registry and stamped onto
+    /// every violation they produce.
+    generation: RuleGeneration,
 }
 
 impl Registry {
@@ -173,7 +176,17 @@ impl Registry {
 
     /// Create registry with configuration-based filtering
     pub fn with_config(config: &Config) -> Self {
-        let mut registry = Self { checks: vec![] };
+        Self::with_config_and_generation(config, RuleGeneration::FIRST)
+    }
+
+    /// Create registry with configuration-based filtering at an explicit
+    /// rule generation. Every check registered here belongs to that
+    /// generation, and every violation they emit is stamped with it.
+    pub fn with_config_and_generation(config: &Config, generation: RuleGeneration) -> Self {
+        let mut registry = Self {
+            checks: vec![],
+            generation,
+        };
         registry.register_enabled_checks(config);
         registry
     }
@@ -226,6 +239,11 @@ impl Registry {
         self.checks.push(check);
     }
 
+    /// The rule generation shared by all checks in this registry.
+    pub fn generation(&self) -> RuleGeneration {
+        self.generation
+    }
+
     /// Return the names of all currently active checks (built-in + custom, minus disabled).
     pub fn active_check_names(&self) -> Vec<&str> {
         self.checks.iter().map(|c| c.name()).collect()
@@ -264,7 +282,11 @@ impl Registry {
                 check
                     .check(node, config, ctx)
                     .into_iter()
-                    .map(move |v| v.with_severity(severity).with_check_name(check.name()))
+                    .map(move |v| {
+                        v.with_severity(severity)
+                            .with_check_name(check.name())
+                            .with_rule_generation(self.generation)
+                    })
             })
             .collect()
     }

@@ -291,6 +291,20 @@ disable_checks = ["require_concurrent_index"]
 ## Debugging Tips
 
 - **Inspect the AST:** Use `diesel-guard dump-ast --sql "..."` to see exactly what fields are available
-- **Runtime errors:** Invalid field access or type errors produce stderr warnings — the check is skipped but other checks continue
-- **Compilation errors:** Syntax errors in `.rhai` files are reported at startup
+- **Compilation and load errors are fatal:** A script that cannot be read or does not compile aborts the run with a `Custom check failed to load` error. diesel-guard never silently skips a broken script, because that would run only part of your rule set while still reporting a clean result. Fix or remove the offending script before checking migrations.
+- **Runtime errors:** Errors raised while a script executes (invalid field access, division by zero, exceeded operation limits, etc.) are reported as a `SCRIPT ERROR` violation on the offending statement so the failure is never silent
 - **Infinite loops:** Scripts that exceed the operations limit are terminated safely with a warning
+
+## Rule generations
+
+Every checker run is backed by a single **rule generation**: the built-in
+checks and every custom script loaded from `custom_checks_dir` are compiled
+together and share one generation identifier, which is also stamped onto every
+violation they produce. A custom script that fails to load prevents the whole
+generation from being created, so a checker can never report "all rules
+passed" while running only half the configured rules.
+
+Programmatic users rebuilding a checker after editing scripts (a hot reload)
+get an atomic transition: `SafetyChecker::reload()` either installs a complete
+new generation or, if any script fails to load, leaves the previous, fully
+loaded generation in place and returns the error.

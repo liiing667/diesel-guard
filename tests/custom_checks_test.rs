@@ -698,7 +698,7 @@ fn test_custom_check_name_conflicts_with_builtin() {
 }
 
 #[test]
-fn test_custom_check_compilation_error_nonfatal() {
+fn test_custom_check_compilation_error_is_fatal() {
     let dir = tempdir().expect("Failed to create temp dir");
 
     // Broken script (invalid syntax)
@@ -719,16 +719,41 @@ fn test_custom_check_compilation_error_nonfatal() {
         custom_checks_dir: Some(dir.path().to_str().unwrap().to_string()),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config).unwrap();
+    let result = SafetyChecker::with_config(config);
 
-    // check_sql should still work — broken script is skipped, valid one fires
-    let violations = checker
-        .check_sql("CREATE INDEX idx ON users(email);")
-        .unwrap();
-
+    // A broken sibling script must abort checker construction. Silently
+    // skipping it would run only half the configured rules while still
+    // reporting "all rules passed".
+    let err = result.expect_err("broken custom script must fail checker build");
+    let rendered = err.to_string();
     assert!(
-        violations.iter().any(|(_, v)| v.operation == "valid_check"),
-        "Valid check should still fire despite broken sibling script"
+        rendered.contains("broken.rhai"),
+        "error should name the offending script, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Compilation error"),
+        "error should describe the compilation failure, got: {rendered}"
+    );
+}
+
+#[test]
+fn test_custom_check_unreadable_script_is_fatal() {
+    let dir = tempdir().expect("Failed to create temp dir");
+
+    // A directory at the .rhai path always fails fs::read_to_string.
+    let script_path = dir.path().join("unreadable.rhai");
+    fs::create_dir(&script_path).unwrap();
+
+    let config = Config {
+        custom_checks_dir: Some(dir.path().to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    let result = SafetyChecker::with_config(config);
+    let err = result.expect_err("unreadable custom script must fail checker build");
+    assert!(
+        err.to_string().contains("unreadable.rhai"),
+        "error should name the unreadable script, got: {}",
+        err
     );
 }
 
@@ -897,4 +922,172 @@ fn test_example_no_unlogged_tables_allows() {
         !has_violation_containing(&violations, "UNLOGGED TABLE"),
         "Regular table should not trigger UNLOGGED violation"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule generation: built-in rules, custom scripts and check evidence must all
+// share one consistent rule generation.
+// ---------------------------------------------------------------------------
+
+fn index_firing_custom_script() -> &'static str {
+    r#"
+    let stmt = node.IndexStmt;
+    if stmt == () { return; }
+    #{ operation: "custom_index_rule", problem: "p", safe_alternative: "s" }
+    "#
+}
+
+#[test]
+fn test_builtin_and_custom_checks_share_the_same_generation() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    fs::write(dir.path().join("my_custom.rhai"), index_firing_custom_script()).unwrap();
+
+    let config = Config {
+        custom_checks_dir: Some(dir.path().to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    let checker = SafetyChecker::with_config(config).unwrap();
+
+    let generation = checker.rule_generation();
+    assert_eq!(generation.as_u64(), 1);
+    assert_eq!(checker.registry().generation(), generation);
+
+    // Evidence from both built-in and custom checks carries the same generation.
+    let violations = checker
+        .check_sql("CREATE INDEX idx ON users(email);")
+        .unwrap();
+    assert!(
+        violations.len() >= 2,
+        "expected built-in + custom violations, got: {violations:?}"
+    );
+    for (_, violation) in &violations {
+        assert_eq!(
+            violation.rule_generation(),
+            generation,
+            "violation {:?} must share the checker's rule generation",
+            violation.operation
+        );
+    }
+}
+
+#[test]
+fn test_successful_reload_advances_generation_and_keeps_full_rule_set() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let checks_dir = dir.path().to_str().unwrap().to_string();
+    fs::write(dir.path().join("my_custom.rhai"), index_firing_custom_script()).unwrap();
+
+    let config = Config {
+        custom_checks_dir: Some(checks_dir),
+        ..Default::default()
+    };
+    let mut checker = SafetyChecker::with_config(config).unwrap();
+    let first_generation = checker.rule_generation();
+    assert_eq!(first_generation.as_u64(), 1);
+
+    // Add a second script, then hot-reload.
+    fs::write(
+        dir.path().join("second_custom.rhai"),
+        r#"
+        let stmt = node.IndexStmt;
+        if stmt == () { return; }
+        #{ operation: "second_custom_rule", problem: "p", safe_alternative: "s" }
+        "#,
+    )
+    .unwrap();
+
+    let new_generation = checker.reload().expect("reload with valid scripts succeeds");
+    assert_eq!(new_generation, first_generation.next());
+    assert_eq!(checker.rule_generation(), new_generation);
+    assert_eq!(checker.registry().generation(), new_generation);
+
+    // The reloaded checker still runs the complete rule set: built-in plus
+    // both custom scripts, all stamped with the new generation.
+    let violations = checker
+        .check_sql("CREATE INDEX idx ON users(email);")
+        .unwrap();
+    let operations: Vec<&str> = violations.iter().map(|(_, v)| v.operation.as_str()).collect();
+    assert!(operations.contains(&"custom_index_rule"));
+    assert!(operations.contains(&"second_custom_rule"));
+    assert!(
+        operations.iter().any(|op| op.contains("ADD INDEX")),
+        "built-in rule must still run after reload, got: {operations:?}"
+    );
+    for (_, violation) in &violations {
+        assert_eq!(violation.rule_generation(), new_generation);
+    }
+}
+
+#[test]
+fn test_failed_reload_keeps_previous_generation_and_full_rule_set() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let checks_dir = dir.path().to_str().unwrap().to_string();
+    fs::write(dir.path().join("my_custom.rhai"), index_firing_custom_script()).unwrap();
+
+    let config = Config {
+        custom_checks_dir: Some(checks_dir),
+        ..Default::default()
+    };
+    let mut checker = SafetyChecker::with_config(config).unwrap();
+    let stable_generation = checker.rule_generation();
+
+    // A previously working migration passes and its evidence uses generation 1.
+    let before = checker
+        .check_sql("CREATE INDEX idx ON users(email);")
+        .unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|(_, v)| v.operation == "custom_index_rule")
+    );
+    assert!(before.iter().all(|(_, v)| v.rule_generation() == stable_generation));
+
+    // Drop a broken script into the directory and attempt a hot reload.
+    fs::write(dir.path().join("broken.rhai"), "this is not valid rhai {{{").unwrap();
+    let reload_err = checker
+        .reload()
+        .expect_err("reload must fail when a script does not compile");
+    assert!(reload_err.to_string().contains("broken.rhai"));
+
+    // The failed reload must not advance the generation or replace the
+    // registry: the checker still runs the previous, fully loaded rule set
+    // and must never report success against a half-loaded set.
+    assert_eq!(checker.rule_generation(), stable_generation);
+    assert_eq!(checker.registry().generation(), stable_generation);
+
+    let after = checker
+        .check_sql("CREATE INDEX idx ON users(email);")
+        .unwrap();
+    let operations: Vec<&str> = after.iter().map(|(_, v)| v.operation.as_str()).collect();
+    assert!(
+        operations.contains(&"custom_index_rule"),
+        "previously loaded custom rule must keep running after failed reload"
+    );
+    assert!(
+        operations.iter().any(|op| op.contains("ADD INDEX")),
+        "built-in rules must keep running after failed reload"
+    );
+    assert!(after.iter().all(|(_, v)| v.rule_generation() == stable_generation));
+
+    // Fix the script and reload — the checker advances to a fresh generation.
+    fs::write(dir.path().join("broken.rhai"), "return;").unwrap();
+    let recovered = checker.reload().expect("reload succeeds once scripts are fixed");
+    assert_eq!(recovered, stable_generation.next());
+    assert_eq!(checker.rule_generation(), recovered);
+}
+
+#[test]
+fn test_broken_script_never_allows_clean_pass() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    // Only a broken script lives in the custom directory.
+    fs::write(dir.path().join("broken.rhai"), "this is not valid rhai {{{").unwrap();
+
+    let config = Config {
+        custom_checks_dir: Some(dir.path().to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+
+    // Construction fails, so callers cannot obtain a checker that would run
+    // only the built-ins and claim the full rule set passed.
+    let result = SafetyChecker::with_config(config);
+    assert!(result.is_err(), "broken script must prevent checker creation");
 }
