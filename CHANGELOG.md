@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- Directory checks now keep per-file results and record files that fail to
+  parse or read as part of the same check generation. A failed file is no
+  longer discarded when a later migration fails, and `diesel-guard check`
+  exits non-zero whenever any file in the generation could not be checked.
+  Single-file and stdin checks, `start_after`, `check_down`, and warning
+  severity behavior are unchanged.
+
 ## 0.12.0 - 2026-06-25
 
 ### Breaking Changes

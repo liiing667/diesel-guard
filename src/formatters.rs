@@ -1,4 +1,5 @@
 use crate::ViolationList;
+use crate::check_report::{CheckFailure, CheckReport};
 use crate::checks::Check;
 use crate::config::Config;
 use crate::violation::Severity;
@@ -10,6 +11,16 @@ pub trait Formatter {
     fn format_results(&self, results: &[(String, ViolationList)]) -> String;
     fn format_checks(&self, checks: &[&dyn Check], config: &Config) -> String;
     fn format_explain(&self, check: &dyn Check, config: &Config) -> String;
+
+    /// Format a complete generation report.
+    ///
+    /// The historical [`Formatter::format_results`] API has no way to carry
+    /// failed files. The default keeps custom formatters source-compatible,
+    /// while the built-in formatters override this method to expose failures
+    /// without mixing them into successful files.
+    fn format_report(&self, report: &CheckReport) -> String {
+        self.format_results(&report.results_with_failures())
+    }
 }
 
 pub struct JsonFormatter;
@@ -32,6 +43,58 @@ impl Formatter for JsonFormatter {
                         "severity": v.severity,
                     })).collect::<Vec<_>>(),
                 })
+            })
+            .collect();
+        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "[]".into())
+    }
+
+    fn format_report(&self, report: &CheckReport) -> String {
+        if report.failures.is_empty() {
+            return self.format_results(&report.results);
+        }
+
+        let output: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter_map(|outcome| {
+                if let Some(failure) = &outcome.failure {
+                    let no_violations: Vec<serde_json::Value> = Vec::new();
+                    let violation = failure.as_violation();
+                    Some(serde_json::json!({
+                        "file": outcome.path.as_str(),
+                        "path": outcome.path.as_str(),
+                        "generation": report.generation.as_u64(),
+                        "violations": no_violations,
+                        "failed": true,
+                        "checked": false,
+                        "check_name": "MigrationCheckFailure",
+                        "severity": "error",
+                        "line": 1,
+                        "operation": violation.operation,
+                        "problem": violation.problem,
+                        "safe_alternative": violation.safe_alternative,
+                        "error": failure.message(),
+                        "message": failure.message(),
+                    }))
+                } else if !outcome.violations.is_empty() {
+                    Some(serde_json::json!({
+                        "file": outcome.path.as_str(),
+                        "path": outcome.path.as_str(),
+                        "generation": report.generation.as_u64(),
+                        "failed": false,
+                        "checked": true,
+                        "violations": outcome.violations.iter().map(|(line, v)| serde_json::json!({
+                            "line": line,
+                            "check_name": v.check_name,
+                            "operation": v.operation,
+                            "problem": v.problem,
+                            "safe_alternative": v.safe_alternative,
+                            "severity": v.severity,
+                        })).collect::<Vec<_>>(),
+                    }))
+                } else {
+                    None
+                }
             })
             .collect();
         serde_json::to_string_pretty(&output).unwrap_or_else(|_| "[]".into())
@@ -95,6 +158,28 @@ impl Formatter for TextFormatter {
             out.push_str(&format_file_violations(file_path, violations));
         }
         out.push_str(&format_summary(total_errors, total_warnings));
+        out.push('\n');
+        out
+    }
+
+    fn format_report(&self, report: &CheckReport) -> String {
+        if report.failures.is_empty() {
+            return self.format_results(&report.results);
+        }
+
+        let mut out = String::new();
+        for outcome in &report.outcomes {
+            if let Some(failure) = &outcome.failure {
+                out.push_str(&format_check_failure(failure));
+            } else if !outcome.violations.is_empty() {
+                out.push_str(&format_file_violations(&outcome.path, &outcome.violations));
+            }
+        }
+        out.push_str(&format_summary_with_failures(
+            report.error_count(),
+            report.warning_count(),
+            report.failures.len(),
+        ));
         out.push('\n');
         out
     }
@@ -186,6 +271,34 @@ impl Formatter for GithubFormatter {
         out
     }
 
+    fn format_report(&self, report: &CheckReport) -> String {
+        if report.failures.is_empty() {
+            return self.format_results(&report.results);
+        }
+
+        let mut out = String::new();
+        for outcome in &report.outcomes {
+            if let Some(failure) = &outcome.failure {
+                let file = encode_property(failure.path());
+                let message =
+                    encode_data(&format!("Failed to check migration: {}", failure.message()));
+                writeln!(out, "::error file={file},line=1::{message}").unwrap();
+            } else {
+                for (line, violation) in &outcome.violations {
+                    let level = match violation.severity {
+                        Severity::Error => "error",
+                        Severity::Warning => "warning",
+                    };
+                    let raw = format!("{}: {}", violation.operation, violation.problem);
+                    let file = encode_property(&outcome.path);
+                    let message = encode_data(&raw);
+                    writeln!(out, "::{level} file={file},line={line}::{message}").unwrap();
+                }
+            }
+        }
+        out
+    }
+
     fn format_checks(&self, checks: &[&dyn Check], config: &Config) -> String {
         TextFormatter.format_checks(checks, config)
     }
@@ -244,6 +357,32 @@ fn format_file_violations(file_path: &str, violations: &ViolationList) -> String
     output
 }
 
+fn format_check_failure(failure: &CheckFailure) -> String {
+    let mut output = String::new();
+
+    write!(
+        output,
+        "{} {} {}\n\n",
+        "❌",
+        "Failed to check migration".red().bold(),
+        failure.path().yellow()
+    )
+    .unwrap();
+
+    writeln!(output, "{}", "Problem:".white().bold()).unwrap();
+    write!(output, "  {}\n\n", failure.message()).unwrap();
+
+    writeln!(output, "{}", "Safe alternative:".green().bold()).unwrap();
+    writeln!(
+        output,
+        "  Fix the migration file (or remove it from the directory), then rerun diesel-guard."
+    )
+    .unwrap();
+
+    output.push('\n');
+    output
+}
+
 fn format_summary(total_errors: usize, total_warnings: usize) -> String {
     match (total_errors, total_warnings) {
         (0, 0) => format!("{}", "✅ No unsafe migrations detected!".green().bold()),
@@ -264,6 +403,35 @@ fn format_summary(total_errors: usize, total_warnings: usize) -> String {
             w.to_string().yellow().bold()
         ),
     }
+}
+
+fn format_summary_with_failures(
+    total_errors: usize,
+    total_warnings: usize,
+    total_failures: usize,
+) -> String {
+    let mut parts = Vec::new();
+
+    if total_errors > 0 {
+        parts.push(format!(
+            "{} unsafe migration(s) detected",
+            total_errors.to_string().red().bold()
+        ));
+    }
+    if total_warnings > 0 {
+        parts.push(format!(
+            "{} migration warning(s)",
+            total_warnings.to_string().yellow().bold()
+        ));
+    }
+    if total_failures > 0 {
+        parts.push(format!(
+            "{} migration(s) failed to check",
+            total_failures.to_string().red().bold()
+        ));
+    }
+
+    format!("\n{} {}", "❌".red(), parts.join(" and "))
 }
 
 // Encodes a string for use as a workflow command property value (the `key=value`

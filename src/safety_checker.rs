@@ -1,18 +1,29 @@
 use crate::ViolationList;
 use crate::adapters::{DieselAdapter, MigrationAdapter, SqlxAdapter};
+pub use crate::check_report::{
+    CheckBatch, CheckFailure, CheckGeneration, CheckOutcome, CheckReport, CheckResult,
+    FileCheckOutcome, MigrationCheckReport, MigrationGeneration, MigrationManifest,
+    ScanGeneration,
+};
 use crate::checks::{MigrationContext, Registry};
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{DieselGuardError, Result};
 use crate::parser;
 use crate::scripting;
 use camino::Utf8Path;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct SafetyChecker {
     registry: Registry,
     config: Config,
     known_check_names: Vec<String>,
+    /// Monotonically increasing generation assigned to each check run.
+    ///
+    /// A generation is a complete snapshot: retries get a fresh generation
+    /// instead of appending to the results of an earlier attempt.
+    generation: AtomicU64,
 }
 
 impl SafetyChecker {
@@ -90,12 +101,32 @@ impl SafetyChecker {
             registry,
             config,
             known_check_names,
+            generation: AtomicU64::new(CheckGeneration::FIRST.as_u64()),
         })
     }
 
     /// Expose the registry for introspection (e.g. list-checks, explain).
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Allocate a new check generation.
+    fn next_generation(&self) -> CheckGeneration {
+        let value = self.generation.fetch_add(1, Ordering::SeqCst);
+        CheckGeneration::new(value)
+    }
+
+    /// The most recently allocated generation for this checker.
+    ///
+    /// A fresh checker reports the generation its first check will use.
+    #[must_use]
+    pub fn generation(&self) -> CheckGeneration {
+        CheckGeneration::new(
+            self.generation
+                .load(Ordering::SeqCst)
+                .saturating_sub(1)
+                .max(1),
+        )
     }
 
     /// Build the migration adapter for the configured framework.
@@ -156,7 +187,17 @@ impl SafetyChecker {
         let adapter = self.adapter()?;
         let ctx = adapter.extract_migration_metadata(path);
 
-        match parser::parse_with_metadata(&sql) {
+        self.check_source_with_context(path, &sql, ctx)
+    }
+
+    /// Check one source snapshot with an already-extracted migration context.
+    fn check_source_with_context(
+        &self,
+        path: &Utf8Path,
+        sql: &str,
+        ctx: MigrationContext,
+    ) -> Result<ViolationList> {
+        match parser::parse_with_metadata(sql) {
             Ok(parsed) => {
                 let ctx = ctx.with_disabled_checks(&parsed.disabled_checks);
                 self.warn_unknown_migration_disabled_checks(
@@ -171,12 +212,51 @@ impl SafetyChecker {
                     &ctx,
                 ))
             }
-            Err(e) => Err(e.with_file_context(path.as_str(), sql)),
+            Err(e) => Err(e.with_file_context(path.as_str(), sql.to_string())),
         }
     }
 
-    /// Check all migration files in a directory
+    /// Check all migration files in a directory.
+    ///
+    /// Per-file parse and read failures are returned in the report instead of
+    /// aborting the whole directory. Files that were checked successfully keep
+    /// their own results and every failure is recorded for the final exit
+    /// status. This is the recoverable-generation API; use
+    /// [`SafetyChecker::check_directory`] for the historical result shape.
     pub fn check_directory(&self, dir: &Utf8Path) -> Result<Vec<(String, ViolationList)>> {
+        let report = self.check_directory_report(dir)?;
+        Ok(report.results_with_failures())
+    }
+
+    /// Check a directory and return a complete per-file generation report.
+    ///
+    /// Unlike [`SafetyChecker::check_directory`], this keeps successful file
+    /// results and failed files separate while still reporting all of them.
+    pub fn check_directory_report(&self, dir: &Utf8Path) -> Result<CheckReport> {
+        let generation = self.next_generation();
+        self.check_directory_report_with_generation(dir, generation)
+    }
+
+    /// Compatibility alias for a recoverable directory check.
+    pub fn check_directory_recoverable(&self, dir: &Utf8Path) -> Result<CheckReport> {
+        self.check_directory_report(dir)
+    }
+
+    /// Compatibility alias for a detailed directory check.
+    pub fn check_directory_detailed(&self, dir: &Utf8Path) -> Result<CheckReport> {
+        self.check_directory_report(dir)
+    }
+
+    /// Compatibility alias for a directory check that keeps failed files.
+    pub fn check_directory_with_failures(&self, dir: &Utf8Path) -> Result<CheckReport> {
+        self.check_directory_report(dir)
+    }
+
+    fn check_directory_report_with_generation(
+        &self,
+        dir: &Utf8Path,
+        generation: CheckGeneration,
+    ) -> Result<CheckReport> {
         let adapter = self.adapter()?;
 
         if let Some(start_after) = self.config.start_after.as_deref() {
@@ -193,38 +273,64 @@ impl SafetyChecker {
             )
             .map_err(|e| crate::error::DieselGuardError::parse_error(e.to_string()))?;
 
-        let mut results = Vec::new();
+        let mut report = CheckReport::new(generation);
 
+        // Freeze the migration sources and metadata before running any check.
+        // The manifest and the per-file outcomes then describe one generation
+        // even if a later migration changes on disk during the run.
+        let mut snapshots = Vec::with_capacity(migration_files.len());
         for mig_file in migration_files {
-            let sql = fs::read_to_string(&mig_file.path)?;
-
+            report.add_manifest_file(mig_file.clone());
+            let source = fs::read_to_string(&mig_file.path);
             let ctx = adapter.extract_migration_metadata(&mig_file.path);
+            snapshots.push((mig_file, ctx, source));
+        }
 
-            match parser::parse_with_metadata(&sql) {
-                Ok(parsed) => {
-                    let ctx = ctx.with_disabled_checks(&parsed.disabled_checks);
-                    self.warn_unknown_migration_disabled_checks(
-                        &ctx.disabled_checks,
-                        &format!("{} migration-scoped disable_checks", mig_file.path),
-                    );
-                    let violations = self.registry.check_stmts_with_context(
-                        &parsed.stmts,
-                        &parsed.sql,
-                        &parsed.ignore_ranges,
-                        &self.config,
-                        &ctx,
-                    );
-                    if !violations.is_empty() {
-                        results.push((mig_file.path.to_string(), violations));
+        for (mig_file, ctx, source) in snapshots {
+            match source {
+                Ok(sql) => {
+                    match self.check_source_with_context(&mig_file.path, &sql, ctx) {
+                        Ok(violations) => {
+                            report.record_violations(mig_file.path.to_string(), violations);
+                        }
+                        Err(e) => {
+                            report.record_failure(CheckFailure::new(
+                                mig_file.path.to_string(),
+                                e.to_string(),
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
-                    return Err(e.with_file_context(mig_file.path.as_str(), sql));
+                    report.record_failure(CheckFailure::new(
+                        mig_file.path.to_string(),
+                        format!("Failed to read migration file: {e}"),
+                    ));
                 }
             }
         }
 
-        Ok(results)
+        Ok(report)
+    }
+
+    /// Check a directory with the historical fail-fast semantics.
+    ///
+    /// This is kept for callers that need an `Err` as soon as any file fails.
+    /// The CLI and new callers should use [`SafetyChecker::check_directory_report`]
+    /// so per-file results are not discarded.
+    pub fn check_directory_strict(
+        &self,
+        dir: &Utf8Path,
+    ) -> Result<Vec<(String, ViolationList)>> {
+        let report = self.check_directory_report(dir)?;
+        let failure = report
+            .failures
+            .first()
+            .map(|failure| (failure.path.clone(), failure.message.clone()));
+        if let Some((path, message)) = failure {
+            return Err(DieselGuardError::parse_error(format!("{path}: {message}")));
+        }
+        Ok(report.results)
     }
 
     // check a migration string from a buffer
@@ -253,6 +359,72 @@ impl SafetyChecker {
             } else {
                 Ok(vec![(path.to_string(), violations)])
             }
+        }
+    }
+
+    /// Check a path and return a complete per-file generation report.
+    ///
+    /// Single files and stdin keep their historical fail-fast behavior: a
+    /// parse error is returned as an error so existing editor integrations see
+    /// the same diagnostic. Directories return a report containing all
+    /// successful per-file results and all failed files.
+    pub fn check_path_report(&self, path: &Utf8Path) -> Result<CheckReport> {
+        let generation = self.next_generation();
+
+        if path.as_str() == "-" {
+            let violations = self.check_buffer(&mut BufReader::new(io::stdin().lock()))?;
+            let mut report = CheckReport::new(generation);
+            let path_string = path.to_string();
+            report.add_manifest_path(path_string.clone());
+            report.record_violations(path_string, violations);
+            return Ok(report);
+        }
+
+        if path.is_dir() {
+            return self.check_directory_report_with_generation(path, generation);
+        }
+
+        let violations = self.check_file(path)?;
+        let mut report = CheckReport::new(generation);
+        let path_string = path.to_string();
+        report.add_manifest_path(path_string.clone());
+        report.record_violations(path_string, violations);
+        Ok(report)
+    }
+
+    /// Compatibility alias for a recoverable path check.
+    pub fn check_path_recoverable(&self, path: &Utf8Path) -> Result<CheckReport> {
+        self.check_path_report(path)
+    }
+
+    /// Compatibility alias for a detailed path check.
+    pub fn check_path_detailed(&self, path: &Utf8Path) -> Result<CheckReport> {
+        self.check_path_report(path)
+    }
+
+    /// Compatibility alias for a path check that keeps failed files.
+    pub fn check_path_with_failures(&self, path: &Utf8Path) -> Result<CheckReport> {
+        if path.is_dir() || path.as_str() == "-" {
+            return self.check_path_report(path);
+        }
+
+        let generation = self.next_generation();
+        let mut report = CheckReport::new(generation);
+        let path_string = path.to_string();
+        report.add_manifest_path(path_string.clone());
+        match self.check_file(path) {
+            Ok(violations) => report.record_violations(path_string, violations),
+            Err(e) => report.record_failure(CheckFailure::new(path_string, e.to_string())),
+        }
+        Ok(report)
+    }
+
+    /// Check a path with the historical fail-fast semantics.
+    pub fn check_path_strict(&self, path: &Utf8Path) -> Result<Vec<(String, ViolationList)>> {
+        if path.is_dir() {
+            self.check_directory_strict(path)
+        } else {
+            self.check_path(path)
         }
     }
 }

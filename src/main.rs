@@ -2,7 +2,6 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use diesel_guard::ast_dump;
 use diesel_guard::formatters::{Formatter, GithubFormatter, JsonFormatter, TextFormatter};
-use diesel_guard::violation::Severity;
 use diesel_guard::{Config, SafetyChecker};
 use miette::{IntoDiagnostic, Result};
 use std::fs;
@@ -157,16 +156,19 @@ EXAMPLES:
 fn run_check(path: &camino::Utf8Path, format: Format) -> Result<()> {
     let config = Config::load().map_err(|e| miette::miette!(e))?;
     let checker = SafetyChecker::with_config(config).map_err(|e| miette::miette!(e))?;
-    let results = checker.check_path(path)?;
-    let total_errors: usize = results
-        .iter()
-        .flat_map(|(_, v)| v)
-        .filter(|(_, v)| v.severity == Severity::Error)
-        .count();
-    print!("{}", format.formatter().format_results(&results));
-    if total_errors > 0 {
+    let report = checker.check_path_report(path)?;
+    print!("{}", format.formatter().format_report(&report));
+    for failure in &report.failures {
+        eprintln!(
+            "Error: failed to check migration '{}': {}",
+            failure.path(),
+            failure.message()
+        );
+    }
+    let exit_code = report.exit_code();
+    if exit_code != 0 {
         let _ = std::io::stdout().flush();
-        exit(1);
+        exit(exit_code);
     }
     Ok(())
 }

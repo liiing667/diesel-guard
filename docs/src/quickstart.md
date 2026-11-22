@@ -61,6 +61,11 @@ points to the exact failing statement:
 help: Check that your SQL syntax is valid
 ```
 
+When checking a directory, a file that cannot be parsed is reported as a failed
+migration while the remaining migrations are still checked. Any failed file
+keeps the command's exit status non-zero, and the output never treats an
+incomplete directory check as clean.
+
 ## JSON Output
 
 For CI/CD or programmatic processing:

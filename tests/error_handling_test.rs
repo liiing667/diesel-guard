@@ -110,13 +110,88 @@ fn test_check_directory_fails_on_invalid_sql_file() {
     fs::write(invalid_dir.join("up.sql"), "NOT VALID SQL SYNTAX HERE;").unwrap();
 
     let checker = SafetyChecker::default();
-    let result = checker.check_directory(Utf8Path::from_path(temp_dir.path()).unwrap());
+    let dir = Utf8Path::from_path(temp_dir.path()).unwrap();
+    let report = checker
+        .check_directory_report(dir)
+        .expect("directory check should return a report");
 
-    // One bad file should fail the entire batch
+    // The generation is incomplete, but the valid file's outcome is kept and
+    // the invalid file is identified explicitly.
+    assert!(report.has_failures());
+    assert!(!report.is_success());
+    assert_eq!(report.exit_code(), 1);
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0].path.contains("invalid"));
     assert!(
-        result.is_err(),
-        "Directory with one invalid SQL file should fail the entire check"
+        report.failures[0]
+            .message
+            .to_lowercase()
+            .contains("parse"),
+        "failure should describe the parse error, got: {}",
+        report.failures[0].message
     );
+    assert_eq!(
+        report.manifest.len(),
+        2,
+        "both migrations belong to the same generation"
+    );
+
+    // The legacy result shape must not look clean when a file failed.
+    let legacy = checker
+        .check_directory(dir)
+        .expect("partial results are returned instead of being discarded");
+    let failed_entry = legacy
+        .iter()
+        .find(|entry| entry.0.contains("invalid"))
+        .expect("failed migration must appear in the legacy result shape");
+    assert_eq!(failed_entry.1[0].1.check_name, "MigrationCheckFailure");
+}
+
+#[test]
+fn test_mixed_migration_retry_keeps_per_file_results_and_exit_consistent() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    let unsafe_dir = temp_dir.path().join("2024_01_01_000000_unsafe");
+    fs::create_dir(&unsafe_dir).unwrap();
+    fs::write(unsafe_dir.join("up.sql"), "DROP TABLE users;").unwrap();
+
+    let invalid_dir = temp_dir.path().join("2024_02_01_000000_invalid");
+    fs::create_dir(&invalid_dir).unwrap();
+    fs::write(invalid_dir.join("up.sql"), "NOT VALID SQL SYNTAX HERE;").unwrap();
+
+    let safe_dir = temp_dir.path().join("2024_03_01_000000_safe");
+    fs::create_dir(&safe_dir).unwrap();
+    fs::write(
+        safe_dir.join("up.sql"),
+        "ALTER TABLE users ADD COLUMN email VARCHAR(255);",
+    )
+    .unwrap();
+
+    let checker = SafetyChecker::with_config(Config {
+        enable_checks: vec!["DropTableCheck".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+    let dir = Utf8Path::from_path(temp_dir.path()).unwrap();
+
+    let first = checker.check_directory_report(dir).unwrap();
+    assert_eq!(first.results.len(), 1);
+    assert!(first.results[0].0.contains("unsafe"));
+    assert_eq!(first.failures.len(), 1);
+    assert!(first.failures[0].path.contains("invalid"));
+    assert!(!first.is_clean());
+    assert_eq!(first.exit_code(), 1);
+
+    // A retry after removing the broken migration is a fresh generation with
+    // only the current manifest and results.
+    fs::remove_dir_all(&invalid_dir).unwrap();
+    let second = checker.check_directory_report(dir).unwrap();
+    assert_ne!(second.generation, first.generation);
+    assert!(second.failures.is_empty());
+    assert_eq!(second.manifest.len(), 2);
+    assert_eq!(second.results.len(), 1);
+    assert!(second.results[0].0.contains("unsafe"));
+    assert_eq!(second.exit_code(), 1);
 }
 
 #[test]

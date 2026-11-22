@@ -16,6 +16,8 @@
 
 pub mod adapters;
 pub mod ast_dump;
+pub mod check_report;
+pub use check_report as report;
 pub mod checks;
 pub mod config;
 pub mod error;
@@ -26,6 +28,11 @@ pub mod scripting;
 pub mod violation;
 
 pub use adapters::{MigrationAdapter, MigrationContext, MigrationFile};
+pub use check_report::{
+    CheckBatch, CheckFailure, CheckGeneration, CheckOutcome, CheckReport, CheckResult,
+    FileCheckOutcome, MigrationCheckReport, MigrationGeneration, MigrationManifest,
+    ScanGeneration,
+};
 pub use config::{Config, ConfigError};
 pub use safety_checker::SafetyChecker;
 pub use violation::Violation;
