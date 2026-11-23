@@ -430,3 +430,154 @@ fn test_safety_assured_with_leading_whitespace() {
     let violations = checker.check_sql(sql).unwrap();
     assert_eq!(violations.len(), 0, "should handle leading whitespace");
 }
+
+#[test]
+fn test_pseudo_directives_in_quotes_do_not_hide_drop_table() {
+    let checker = SafetyChecker::with_config(Config {
+        enable_checks: vec!["DropTableCheck".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+    let sql = r"
+CREATE FUNCTION f() RETURNS int AS $$
+-- safety-assured:start
+SELECT 1;
+$$ LANGUAGE sql;
+
+DROP TABLE legacy_users;
+
+CREATE FUNCTION g() RETURNS int AS $$
+-- safety-assured:end
+SELECT 1;
+$$ LANGUAGE sql;
+    ";
+
+    let violations = checker.check_sql(sql).unwrap();
+    assert_eq!(
+        violations.len(),
+        1,
+        "DROP TABLE outside quoted decoys must still be reported"
+    );
+    assert_eq!(violations[0].0, 7, "the report must use source line numbers");
+    assert_eq!(violations[0].1.operation, "DROP TABLE");
+}
+
+#[test]
+fn test_retry_after_dollar_quote_repair_uses_fresh_directive_ranges() {
+    let checker = SafetyChecker::with_config(Config {
+        enable_checks: vec!["DropTableCheck".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    // The closing dollar-quote tag is incomplete, so this generation cannot be
+    // parsed. It must not publish a partial safety-assured generation.
+    let broken = r"
+CREATE FUNCTION f() RETURNS int AS $body$
+-- safety-assured:start
+SELECT 1;
+$body
+DROP TABLE legacy_users;
+    ";
+    assert!(
+        checker.check_sql(broken).is_err(),
+        "malformed dollar quote should be a parse error"
+    );
+
+    // Retrying after repairing the tag must report the real DROP TABLE rather
+    // than reusing an ignore range from the failed generation.
+    let repaired = r"
+CREATE FUNCTION f() RETURNS int AS $body$
+-- safety-assured:start
+SELECT 1;
+$body$ LANGUAGE sql;
+DROP TABLE legacy_users;
+    ";
+    let violations = checker.check_sql(repaired).unwrap();
+    assert_eq!(
+        violations.len(),
+        1,
+        "the repaired migration must not inherit stale safety-assured ranges"
+    );
+    assert_eq!(violations[0].1.operation, "DROP TABLE");
+}
+
+#[test]
+fn test_retry_after_partial_parse_does_not_reactivate_pseudo_directives() {
+    let checker = SafetyChecker::with_config(Config {
+        enable_checks: vec!["DropTableCheck".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let broken = r"
+SELECT '
+-- safety-assured:start
+';
+DROP TABLE legacy_users;
+SELECT '
+-- safety-assured:end
+';
+CREATE TABLE @bad;
+    ";
+    assert!(
+        checker.check_sql(broken).is_err(),
+        "the incomplete migration should fail to parse"
+    );
+
+    let repaired = r"
+SELECT '
+-- safety-assured:start
+';
+DROP TABLE legacy_users;
+SELECT '
+-- safety-assured:end
+';
+CREATE TABLE good_table (id int);
+    ";
+    let violations = checker.check_sql(repaired).unwrap();
+    assert_eq!(
+        violations.len(),
+        1,
+        "a retry must not inherit directive ranges from the partial parse"
+    );
+    assert_eq!(violations[0].1.operation, "DROP TABLE");
+}
+
+#[test]
+fn test_real_range_from_first_scan_is_not_reused_after_quote_fix() {
+    let checker = SafetyChecker::with_config(Config {
+        enable_checks: vec!["DropTableCheck".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let first = r"
+-- safety-assured:start
+DROP TABLE legacy_users;
+-- safety-assured:end
+    ";
+    assert!(
+        checker.check_sql(first).unwrap().is_empty(),
+        "the genuine first-generation block should suppress the drop"
+    );
+
+    // After the quotes are corrected, the directive-looking lines are data.
+    // A later parse must not reuse the first generation's ignore range.
+    let corrected = r"
+SELECT '
+-- safety-assured:start
+';
+DROP TABLE legacy_users;
+SELECT '
+-- safety-assured:end
+';
+    ";
+    let violations = checker.check_sql(corrected).unwrap();
+    assert_eq!(
+        violations.len(),
+        1,
+        "the corrected migration must not inherit the earlier block"
+    );
+    assert_eq!(violations[0].1.operation, "DROP TABLE");
+}

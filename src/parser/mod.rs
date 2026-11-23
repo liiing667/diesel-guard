@@ -6,7 +6,7 @@ pub mod comment_parser;
 
 pub use comment_parser::IgnoreRange;
 
-/// Parsed SQL with metadata for safety-assured handling
+/// One immutable SQL parse generation with its safety-assured metadata.
 pub struct ParsedSql {
     pub stmts: Vec<RawStmt>,
     pub sql: String,
@@ -45,15 +45,23 @@ pub fn parse(sql: &str) -> Result<Vec<RawStmt>> {
 
 /// Parse SQL with metadata for safety-assured blocks
 pub fn parse_with_metadata(sql: &str) -> Result<ParsedSql> {
-    let ignore_ranges = comment_parser::CommentParser::parse_ignore_ranges(sql)?;
-    let disabled_checks = comment_parser::CommentParser::parse_disabled_checks(sql);
+    // Parse statements first. If any statement fails, no directive metadata is
+    // published and a retry starts from a clean parse generation.
     let stmts = parse(sql)?;
+    let directives = comment_parser::CommentParser::parse(sql)?;
+    if let Some(name) =
+        comment_parser::CommentParser::duplicate_disabled_check(&directives.disabled_checks)
+    {
+        return Err(DieselGuardError::parse_error(format!(
+            "Conflicting check name '{name}' in migration-scoped disable_checks: the check is disabled more than once. List each check at most once."
+        )));
+    }
 
     Ok(ParsedSql {
         stmts,
         sql: sql.to_string(),
-        ignore_ranges,
-        disabled_checks,
+        ignore_ranges: directives.ignore_ranges,
+        disabled_checks: directives.disabled_checks,
     })
 }
 
@@ -115,6 +123,22 @@ ALTER TABLE users ADD COLUMN admin BOOLEAN DEFAULT FALSE;
         let result = parse_with_metadata(sql).unwrap();
         assert_eq!(result.stmts.len(), 1);
         assert_eq!(result.disabled_checks, vec!["AddColumnCheck"]);
+    }
+
+    #[test]
+    fn test_parse_with_metadata_rejects_conflicting_disabled_checks() {
+        let sql = r"
+-- diesel-guard:disable AddColumnCheck
+-- diesel-guard:disable AddColumnCheck
+ALTER TABLE users ADD COLUMN admin BOOLEAN DEFAULT FALSE;
+        ";
+
+        let err = parse_with_metadata(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Conflicting check name 'AddColumnCheck'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

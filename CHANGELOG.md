@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- **Directives inside quoted SQL no longer suppress checks.** `-- safety-assured:start`, `-- safety-assured:end`, and `-- diesel-guard:disable ...` are now read only from real line comments emitted by PostgreSQL's scanner. Directive text inside string literals, quoted identifiers, dollar-quoted function bodies, and block comments is ignored, so a later `DROP TABLE` cannot be hidden by a pseudo-directive. Ignore ranges, disabled checks, parsed statements, and reported line numbers are all derived from one fresh parse generation; repairing a migration and retrying cannot reuse ranges from an earlier scan.
+
+### Changed
+
+- **Unknown and conflicting migration-scoped disable names fail closed.** An unrecognized check name in a `-- diesel-guard:disable ...` directive now aborts the run instead of printing a warning and continuing, and listing the same check more than once is rejected as a conflicting directive instead of being silently deduplicated.
+
 ## 0.12.0 - 2026-06-25
 
 ### Breaking Changes

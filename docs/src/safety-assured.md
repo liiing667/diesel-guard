@@ -11,6 +11,10 @@ ALTER TABLE posts DROP COLUMN old_field;
 
 All statements between the start and end markers are skipped by all checks — both built-in and custom.
 
+Directives are recognized only in real SQL line comments. Directive-looking text
+inside string literals, quoted identifiers, dollar-quoted function bodies, and
+block comments is treated as SQL data and has no effect.
+
 ## Disable Specific Checks for One Migration
 
 When only one check is known to be acceptable for a migration, disable that check by name instead of suppressing the whole statement:
@@ -80,3 +84,5 @@ Rules:
 - Unclosed blocks are errors
 - Unmatched `end` directives (without a preceding `start`) are errors
 - The directives are case-insensitive
+- Unknown check names in `diesel-guard:disable` directives are errors
+- Listing the same check more than once is a conflicting directive and is an error

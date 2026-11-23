@@ -110,43 +110,39 @@ impl SafetyChecker {
         }
     }
 
-    fn warn_unknown_migration_disabled_checks(&self, disabled_checks: &[String], source: &str) {
-        let mut warned_names = Vec::new();
-
+    /// Validate migration-scoped disable directives fail-closed.
+    ///
+    /// An unknown check name is rejected rather than silently disabling nothing.
+    /// Duplicate (conflicting) names are rejected earlier by the comment parser.
+    fn validate_migration_disabled_checks(
+        &self,
+        disabled_checks: &[String],
+        source: &str,
+    ) -> Result<()> {
         for name in disabled_checks {
-            let name = name.as_str();
-            if warned_names.contains(&name) {
-                continue;
-            }
-            warned_names.push(name);
-
             if !self
                 .known_check_names
                 .iter()
                 .any(|known| known.as_str() == name)
             {
-                eprintln!(
-                    "Warning: Unknown check name '{name}' in {source}. Run list-checks to see available checks."
-                );
+                return Err(crate::error::DieselGuardError::parse_error(format!(
+                    "Unknown check name '{name}' in {source}. Run list-checks to see available checks."
+                )));
             }
         }
+
+        Ok(())
     }
 
     /// Check SQL string for violations
     pub fn check_sql(&self, sql: &str) -> Result<ViolationList> {
         let parsed = parser::parse_with_metadata(sql)?;
         let ctx = MigrationContext::default().with_disabled_checks(&parsed.disabled_checks);
-        self.warn_unknown_migration_disabled_checks(
+        self.validate_migration_disabled_checks(
             &ctx.disabled_checks,
             "migration-scoped disable_checks",
-        );
-        Ok(self.registry.check_stmts_with_context(
-            &parsed.stmts,
-            &parsed.sql,
-            &parsed.ignore_ranges,
-            &self.config,
-            &ctx,
-        ))
+        )?;
+        Ok(self.registry.check_parsed_with_context(&parsed, &self.config, &ctx))
     }
 
     /// Check a single migration file
@@ -159,17 +155,11 @@ impl SafetyChecker {
         match parser::parse_with_metadata(&sql) {
             Ok(parsed) => {
                 let ctx = ctx.with_disabled_checks(&parsed.disabled_checks);
-                self.warn_unknown_migration_disabled_checks(
+                self.validate_migration_disabled_checks(
                     &ctx.disabled_checks,
                     &format!("{path} migration-scoped disable_checks"),
-                );
-                Ok(self.registry.check_stmts_with_context(
-                    &parsed.stmts,
-                    &parsed.sql,
-                    &parsed.ignore_ranges,
-                    &self.config,
-                    &ctx,
-                ))
+                )?;
+                Ok(self.registry.check_parsed_with_context(&parsed, &self.config, &ctx))
             }
             Err(e) => Err(e.with_file_context(path.as_str(), sql)),
         }
@@ -203,14 +193,12 @@ impl SafetyChecker {
             match parser::parse_with_metadata(&sql) {
                 Ok(parsed) => {
                     let ctx = ctx.with_disabled_checks(&parsed.disabled_checks);
-                    self.warn_unknown_migration_disabled_checks(
+                    self.validate_migration_disabled_checks(
                         &ctx.disabled_checks,
                         &format!("{} migration-scoped disable_checks", mig_file.path),
-                    );
-                    let violations = self.registry.check_stmts_with_context(
-                        &parsed.stmts,
-                        &parsed.sql,
-                        &parsed.ignore_ranges,
+                    )?;
+                    let violations = self.registry.check_parsed_with_context(
+                        &parsed,
                         &self.config,
                         &ctx,
                     );
@@ -796,20 +784,33 @@ mod tests {
     }
 
     #[test]
-    fn test_check_sql_warns_on_duplicate_migration_disabled_checks() {
+    fn test_check_sql_errors_on_duplicate_migration_disabled_checks() {
         let checker = SafetyChecker::default();
-        // Duplicate name in disable directive — warn_unknown_migration_disabled_checks deduplicates.
+        // Duplicate name in disable directive is a conflict and must fail closed.
         let sql = "-- diesel-guard:disable AddColumnCheck,AddColumnCheck\nALTER TABLE t ADD COLUMN x TEXT;";
-        // Should not panic or error; just runs (warning goes to stderr).
-        let _ = checker.check_sql(sql).unwrap();
+        let err = checker
+            .check_sql(sql)
+            .expect_err("duplicate disable names must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Conflicting check name 'AddColumnCheck'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn test_check_sql_warns_on_unknown_migration_disabled_check() {
+    fn test_check_sql_errors_on_unknown_migration_disabled_check() {
         let checker = SafetyChecker::default();
-        // FakeCheck is not a known check name — triggers the eprintln warning path.
+        // FakeCheck is not a known check name — fail closed instead of warning.
         let sql =
             "-- diesel-guard:disable FakeCheckThatDoesNotExist\nALTER TABLE t ADD COLUMN x TEXT;";
-        let _ = checker.check_sql(sql).unwrap();
+        let err = checker
+            .check_sql(sql)
+            .expect_err("unknown disable name must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Unknown check name 'FakeCheckThatDoesNotExist'"),
+            "unexpected error: {err}"
+        );
     }
 }

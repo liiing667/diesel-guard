@@ -97,7 +97,7 @@ mod helpers {
 }
 
 use crate::ViolationList;
-use crate::parser::IgnoreRange;
+use crate::parser::{IgnoreRange, ParsedSql};
 use crate::violation::Violation;
 pub use helpers::*;
 use pg_helpers::{NodeEnum, extract_node};
@@ -274,6 +274,9 @@ impl Registry {
     /// Returns `(line, violation)` pairs where `line` is the 1-indexed line number of
     /// the statement that produced the violation.
     ///
+    /// `stmts`, `sql`, and `ignore_ranges` must all come from the same parsed
+    /// source generation.
+    ///
     /// Uses RawStmt.stmt_location (byte offset) to determine which line each
     /// statement falls on, then skips checks for statements in safety-assured blocks.
     pub fn check_stmts_with_context(
@@ -317,6 +320,25 @@ impl Registry {
         }
 
         violations
+    }
+
+    /// Check all statements and directives from one parsed SQL generation.
+    ///
+    /// Taking [`ParsedSql`] as a unit prevents statement locations, ignore
+    /// ranges, and the reported source from being mixed across re-parses.
+    pub fn check_parsed_with_context(
+        &self,
+        parsed: &ParsedSql,
+        config: &Config,
+        ctx: &MigrationContext,
+    ) -> ViolationList {
+        self.check_stmts_with_context(
+            &parsed.stmts,
+            &parsed.sql,
+            &parsed.ignore_ranges,
+            config,
+            ctx,
+        )
     }
 
     /// Get all built-in check names (regardless of which are enabled).
