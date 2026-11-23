@@ -1,43 +1,20 @@
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use diesel_guard::ast_dump;
-use diesel_guard::formatters::{Formatter, GithubFormatter, JsonFormatter, TextFormatter};
-use diesel_guard::violation::Severity;
+use diesel_guard::formatters::Formatter;
+use diesel_guard::output::{
+    exit_code, parse_formats, plan_outputs, plan_outputs_from_base, publish_snapshot,
+    render_stdout, ViolationSnapshot,
+};
+use diesel_guard::output::OutputFormat;
 use diesel_guard::{Config, SafetyChecker};
 use miette::{IntoDiagnostic, Result};
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::exit;
 
 const CONFIG_TEMPLATE: &str = include_str!("../diesel-guard.toml.example");
-
-#[derive(clap::ValueEnum, Clone, Copy, Default)]
-enum Format {
-    #[default]
-    Text,
-    Json,
-    Github,
-}
-
-impl std::fmt::Display for Format {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Format::Text => write!(f, "text"),
-            Format::Json => write!(f, "json"),
-            Format::Github => write!(f, "github"),
-        }
-    }
-}
-
-impl Format {
-    fn formatter(self) -> Box<dyn Formatter> {
-        match self {
-            Format::Text => Box::new(TextFormatter),
-            Format::Json => Box::new(JsonFormatter),
-            Format::Github => Box::new(GithubFormatter),
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -93,9 +70,24 @@ EXAMPLES:
         /// Path to migration file or directory, or "-" for stdin (default: "migrations/")
         path: Option<Utf8PathBuf>,
 
-        /// Output format (default: text)
-        #[arg(long, default_value_t = Format::Text)]
-        format: Format,
+        /// Output format(s): text, json, github (repeat or comma-separate)
+        #[arg(
+            long,
+            short = 'f',
+            visible_alias = "report-format",
+            value_delimiter = ',',
+            action = clap::ArgAction::Append
+        )]
+        format: Vec<String>,
+
+        /// Write a report to this path; repeat to map several formats in order
+        #[arg(
+            long,
+            short = 'o',
+            visible_aliases = ["output-file", "report-path", "report"],
+            action = clap::ArgAction::Append
+        )]
+        output: Vec<Utf8PathBuf>,
     },
 
     /// Initialize diesel-guard configuration file
@@ -139,8 +131,8 @@ EXAMPLES:
     /// List all available checks
     ListChecks {
         /// Output format (default: text)
-        #[arg(long, default_value_t = Format::Text)]
-        format: Format,
+        #[arg(long, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 
     /// Show full description of a specific check
@@ -149,24 +141,60 @@ EXAMPLES:
         check_name: String,
 
         /// Output format (default: text)
-        #[arg(long, default_value_t = Format::Text)]
-        format: Format,
+        #[arg(long, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 }
 
-fn run_check(path: &camino::Utf8Path, format: Format) -> Result<()> {
+fn run_check(
+    path: &camino::Utf8Path,
+    format_args: &[String],
+    output_args: &[Utf8PathBuf],
+) -> Result<()> {
+    let formats = parse_formats(format_args.join(",")).map_err(|e| miette::miette!(e))?;
+    if output_args.len() > formats.len() {
+        return Err(miette::miette!(
+            "got {} output path(s) for {} selected format(s)",
+            output_args.len(),
+            formats.len()
+        ));
+    }
+
     let config = Config::load().map_err(|e| miette::miette!(e))?;
     let checker = SafetyChecker::with_config(config).map_err(|e| miette::miette!(e))?;
     let results = checker.check_path(path)?;
-    let total_errors: usize = results
-        .iter()
-        .flat_map(|(_, v)| v)
-        .filter(|(_, v)| v.severity == Severity::Error)
-        .count();
-    print!("{}", format.formatter().format_results(&results));
-    if total_errors > 0 {
+
+    // Freeze one generation: the rendered reports and the process status below
+    // must all describe the same violation set.
+    let snapshot = ViolationSnapshot::new(results);
+    let code = exit_code(&snapshot.results);
+
+    if output_args.is_empty() && formats.len() == 1 {
+        // A single format keeps the historical stdout behaviour exactly.
+        let payload = render_stdout(&snapshot.results, &formats);
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(payload.as_bytes()).into_diagnostic()?;
+        stdout.flush().into_diagnostic()?;
+    } else {
+        // Several selected formats publish one file per format, all in the
+        // same transaction.  Without explicit paths the historical report
+        // naming scheme is used.
+        let paths: Vec<PathBuf> = output_args
+            .iter()
+            .map(|path| PathBuf::from(path.as_str()))
+            .collect();
+        let targets = if output_args.len() == 1 && formats.len() > 1 {
+            plan_outputs_from_base(&formats, &paths[0])
+        } else {
+            plan_outputs(&formats, &paths).map_err(|e| miette::miette!(e))?
+        };
+        publish_snapshot(&snapshot, &targets)
+            .map_err(|e| miette::miette!("failed to publish report(s): {e}"))?;
+    }
+
+    if code != 0 {
         let _ = std::io::stdout().flush();
-        exit(1);
+        exit(code);
     }
     Ok(())
 }
@@ -182,14 +210,14 @@ fn load_all_checks() -> Result<(Config, SafetyChecker)> {
     Ok((config, checker))
 }
 
-fn run_list_checks(format: Format) -> Result<()> {
+fn run_list_checks(format: OutputFormat) -> Result<()> {
     let (config, checker) = load_all_checks()?;
     let checks: Vec<_> = checker.registry().iter_checks().collect();
     print!("{}", format.formatter().format_checks(&checks, &config));
     Ok(())
 }
 
-fn run_explain(check_name: &str, format: Format) -> Result<()> {
+fn run_explain(check_name: &str, format: OutputFormat) -> Result<()> {
     let (config, checker) = load_all_checks()?;
     let Some(check) = checker
         .registry()
@@ -220,9 +248,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Check { path, format } => {
+        Commands::Check {
+            path,
+            format,
+            output,
+        } => {
             let path = path.unwrap_or_else(|| Utf8PathBuf::from("migrations"));
-            run_check(&path, format)?;
+            run_check(&path, &format, &output)?;
         }
 
         Commands::DumpAst { sql, file } => {

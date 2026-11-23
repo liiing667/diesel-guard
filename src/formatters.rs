@@ -6,6 +6,21 @@ use colored::Colorize;
 use serde_json;
 use std::fmt::Write;
 
+pub use crate::output::{
+    commit, commit_reports, derive_output_path, format_all, format_results, parse_format, parse_formats,
+    plan_outputs, plan_outputs_from_base, plan_outputs_named, plan_outputs_str,
+    publish, publish_all, publish_check_results, publish_formatted_results, publish_formatters,
+    publish_outputs, publish_report, publish_reports, publish_results, publish_selected,
+    publish_selected_formatters, publish_snapshot, publish_targets, render_all,
+    render_and_publish, render_results, render_stdout, write_outputs, write_report,
+    write_report_to, write_reports, Format, FormatList, FormatSpec, FormatTarget, FormatterSelection,
+    FormatterSet, FormattedOutput, OutputError, OutputFormat, OutputSpec, OutputTarget, PublishError,
+    PublishTransaction, RenderedOutput, ReportError, ReportFormat, ReportTarget,
+    CheckBatch, CheckGeneration, CheckOutcome, CheckReport, CheckResult, CheckSnapshot,
+    MigrationGeneration, MigrationReport, MigrationSnapshot, OutputReport, PublishSnapshot, Report,
+    ReportSnapshot, ScanGeneration, SelectedFormatters, SnapshotResults, ViolationSnapshot,
+};
+
 pub trait Formatter {
     fn format_results(&self, results: &[(String, ViolationList)]) -> String;
     fn format_checks(&self, checks: &[&dyn Check], config: &Config) -> String;

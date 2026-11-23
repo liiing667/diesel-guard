@@ -20,6 +20,7 @@ pub mod checks;
 pub mod config;
 pub mod error;
 pub mod formatters;
+pub mod output;
 pub mod parser;
 pub mod safety_checker;
 pub mod scripting;
@@ -27,6 +28,23 @@ pub mod violation;
 
 pub use adapters::{MigrationAdapter, MigrationContext, MigrationFile};
 pub use config::{Config, ConfigError};
+pub use output as publish;
+pub use output as report;
+pub use output::{
+    commit, commit_reports, count_errors, count_warnings, derive_output_path, exit_code, format_all,
+    format_results, is_clean, parse_format, parse_formats, plan_outputs, plan_outputs_from_base,
+    plan_outputs_named, plan_outputs_str, publish_all, publish_check_results,
+    publish_formatted_results, publish_formatters, publish_outputs, publish_report,
+    publish_reports, publish_results, publish_selected, publish_selected_formatters,
+    publish_snapshot, publish_targets, publish_to_writer, render_all, render_and_publish,
+    render_results, render_stdout, write_outputs, write_report, write_report_to, write_reports,
+    CheckBatch, CheckGeneration, CheckOutcome, CheckReport, CheckResult, CheckSnapshot, Format, FormatList,
+    FormatSpec, FormatterSelection, FormatterSet, FormattedOutput, FormatTarget,
+    MigrationGeneration, MigrationReport, MigrationSnapshot, OutputError, OutputFormat,
+    OutputReport, OutputSpec, OutputTarget, PublishError, PublishSnapshot, PublishTransaction,
+    RenderedOutput, Report, ReportError, ReportFormat, ReportSnapshot, ReportTarget,
+    ScanGeneration, SelectedFormatters, SnapshotResults, ViolationSnapshot,
+};
 pub use safety_checker::SafetyChecker;
 pub use violation::Violation;
 
